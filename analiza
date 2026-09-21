@@ -1,0 +1,30 @@
+min ped time: 8s
+min car time: 20s
+safety time: 10s
+max ped time:
+
+
+states:
+s0: green for cars (cars green - ped red)
+s1: yellow cars - red ped
+s2: red cars - red ped (safety time)
+s3: green for ped (ped green - car red)
+s4: red ped - red cars  safety time
+s5: red ped - red-yellow car
+s6: all yellow
+
+depends:
+time of the day
+pedestrian waiting time
+vehicle waiting time
+amount of pedestrians
+amount of vehicles
+
+
+fixed cycle:
+0 - 68s : green for cars, red for pedestrians
+68s - 72s : yellow for cars, red for pedestrians
+72s - 73s : red for all
+73s - 81s : green for pedestrians, red for cars
+81s - 91s : red for all
+91s - 92s : red and yellow for cars, red for pedestrian
