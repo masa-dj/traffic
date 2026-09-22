@@ -26,3 +26,10 @@ class PedestrianRecord:
     appeared_at: float
     left: float
     waiting_time: float
+
+
+@dataclass
+class Camera:
+    name: str
+    source: str
+    points: list
