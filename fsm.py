@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum, auto
+from datetime import time
 
 CAR_MIN_GREEN = 30.0
 PED_MIN_GREEN = 8.0
@@ -51,3 +52,52 @@ class Transition:
     src: State
     dst: State
     reason: str
+
+
+# Create instance of "parameters package" to feed to machine
+@dataclass(frozen=True)
+class Config:
+    night_start: time = time(22, 0)
+    night_end: time = time(5, 0)
+
+    w_count: float = 1.0
+    w_wait: float = 0.1
+    w_hold: float = 1.0
+    ped_priority: float = 2.0
+    car_window: float = 30.0
+    ped_window: float = 5.0
+    ped_max_wait: float = 90.0
+
+    ped_min_remaining: float = 0.0
+
+    # Default values to prevent errors
+    def __post_init__(self):
+        if min(self.w_count, self.w_wait, self.w_hold, self.ped_priority) < 0:
+            raise ValueError("Weights cannot be negative")
+
+    def is_night(self, tod: time) -> bool:
+        if self.night_start > self.night_end:
+            return tod >= self.night_start or tod < self.night_end
+        return self.night_start <= tod < self.night_end
+
+
+class FiniteStateMachine:
+    def __init__(self, config: Config(), initial: State = State.CAR_RED_YELLOW, t0: float=0):
+        self.config = config
+        self.state = initial
+        self.entered_at = t0
+
+        self.history: list[Transition] = []
+
+    @property
+    def lamps(self) -> tuple[Lamp, Lamp]:
+        return LAMPS[self.state]
+
+    # Transition function
+    def _go(self, t: float, dst: State, reason: str) -> None:
+        return None
+
+    # Decision function
+    def step(self, t: float, tod: time, ped_arrivals: int = 0, car_arrivals: int = 0) -> State:
+        return State.FLASHING_YELLOW
+
