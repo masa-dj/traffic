@@ -20,6 +20,13 @@ vehicle waiting time
 amount of pedestrians
 amount of vehicles
 
+parameters for fsm:
+amount of participants (both cars and pedestrians) + longest waiting -> pressure (should i force green light)
+frequency of incoming participants -> hold (should i keep light longer)
+decision factor -> weights
+time of day
+priority
+
 
 fixed cycle:
 0 - 68s : green for cars, red for pedestrians
