@@ -8,7 +8,7 @@ CYCLE_PLAN = [
     (72, 73, "red", "red"),
     (73, 81, "red", "green"),
     (81, 91, "red", "red"),
-    (91, 92, "red+yellow", "red"),
+    (91, 93, "red+yellow", "red"),
 ]
 CYCLE = CYCLE_PLAN[-1][1]
 

@@ -109,13 +109,13 @@ class FiniteStateMachine:
         if not self.ped_waiting:
             return 0.0
         c = self.config
-        return 0
+        return c.ped_priority * (c.w_count * len(self.ped_waiting) + c.w_wait * (t - self.ped_waiting[0]))
 
     def _car_pressure(self, t: float) -> float:
         if not self.car_waiting:
             return 0.0
         c = self.config
-        return 0
+        return c.w_count * len(self.car_waiting) + c.w_wait * (t - self.car_waiting[0])
 
     # Calculate if it is worth to keep green
     def _ped_hold(self) -> float:
