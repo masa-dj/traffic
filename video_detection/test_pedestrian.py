@@ -4,7 +4,7 @@ from datatypes import Camera
 cameras = [
     Camera(
         name="Pedestrians 1",
-        source="calibrate_3.mp4",
+        source="video_detection/calibrate_3.mp4",
         points=[
             [170, 230],
             [380, 225],
@@ -14,7 +14,7 @@ cameras = [
     ),
     Camera(
         name="Pedestrians 2",
-        source="calibrate_4.mp4",
+        source="video_detection/calibrate_4.mp4",
         points=[
             [235, 200],
             [410, 195],
@@ -27,10 +27,10 @@ cameras = [
 
 def main():
     detector = PedestrianDetector(
-        model_path="yolo26s.pt",
+        model_path="../yolo26s.pt",
     )
 
-    camera = cameras[0]
+    camera = cameras[1]
 
     records = detector.process_video(
         video_source=camera.source,
