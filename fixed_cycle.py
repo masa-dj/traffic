@@ -18,12 +18,17 @@ PED_GO = {"green"}
 
 # Grouping based on type of participant into 2 groups
 PED_TYPES = {"person", "pedestrian"}
-CAR_TYPES = {"car", "vehicle", "truck", "bus", "motorcycle"}
+CAR_TYPES = {"car", "vehicle", "truck", "bus", "motorcycle", "bicycle"}
 
 
 # Lookup the cycle to determine green light windows for respected groups
-def go_windows(lamp_index: int, go_lamps: set[str]) -> list[tuple[float, float]]:
-    return [(p[0], p[1]) for p in CYCLE_PLAN if p[2 + lamp_index] in go_lamps]
+def go_windows(lamp_index, go_lamps):
+    windows = []
+    for start, end, car, ped in CYCLE_PLAN:
+        lamp = car if lamp_index == 0 else ped
+        if lamp in go_lamps:
+            windows.append((start, end))
+    return windows
 
 
 CAR_WINDOWS = go_windows(0, CAR_GO)

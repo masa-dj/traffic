@@ -4,7 +4,7 @@ from datatypes import Camera
 cameras = [
     Camera(
         name="Pedestrians 1",
-        source="video_detection/calibrate_3.mp4",
+        source="video_detection/try.mp4",
         points=[
             [170, 230],
             [380, 225],

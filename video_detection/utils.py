@@ -4,6 +4,7 @@ import numpy as np
 # Checking the percentage of object inside of ROI
 def rect_in_zone(x1, y1, x2, y2, mask):
     h, w = mask.shape
+    # clipping
     x1c, y1c = max(x1, 0), max(y1, 0)
     x2c, y2c = min(x2, w), min(y2, h)
 

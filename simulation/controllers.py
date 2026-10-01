@@ -1,3 +1,8 @@
+from datetime import time
+
+from fsm import FiniteStateMachine, Config, LAMPS
+
+
 CYCLE_PLAN = [
     (0, 68, "green", "red"),
     (68, 72, "yellow", "red"),
@@ -22,14 +27,35 @@ class FixedCycleController:
         for start, end, car, ped in self.plan:
             if start <= t_mod < end:
                 return car, ped
-        _, _, car, ped = self.plan[-1]
+        # Fallback
+        start, end, car, ped = self.plan[-1]
         return car, ped
 
 
 class SmartCycleController:
-    def __init__(self):
-        self._fallback = FixedCycleController()
+    def __init__(self, config: Config = None, tod: time = time(12, 0)):
+        self.fsm = FiniteStateMachine(config or Config())
+        self.tod = tod
+        self._pending_ped_arrivals = 0
+        self._pending_car_arrivals = 0
+
+    def notify_arrival(self, kind):
+        if kind == "pedestrian":
+            self._pending_ped_arrivals += 1
+        elif kind == "vehicle":
+            self._pending_car_arrivals += 1
+        else:
+            raise ValueError(f"Unknown arrival kind: {kind!r}")
 
     def state_at(self, t):
-        # TODO: add the right logic
-        return self._fallback.state_at(t)
+        state = self.fsm.step(
+            t,
+            self.tod,
+            ped_arrivals=self._pending_ped_arrivals,
+            car_arrivals=self._pending_car_arrivals,
+        )
+        self._pending_ped_arrivals = 0
+        self._pending_car_arrivals = 0
+
+        car_lamp, ped_lamp = LAMPS[state]
+        return car_lamp.value, ped_lamp.value
