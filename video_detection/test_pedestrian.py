@@ -30,7 +30,7 @@ def main():
         model_path="../yolo26s.pt",
     )
 
-    camera = cameras[1]
+    camera = cameras[0]
 
     records = detector.process_video(
         video_source=camera.source,
