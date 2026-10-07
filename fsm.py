@@ -84,7 +84,7 @@ class Config:
 
 
 class FiniteStateMachine:
-    def __init__(self, config: Config(), initial: State = State.CAR_RED_YELLOW, t0: float = 0):
+    def __init__(self, config: Config(), initial: State = State.CAR_GREEN, t0: float = 0):
         self.config = config
         self.state = initial
         self.entered_at = t0
