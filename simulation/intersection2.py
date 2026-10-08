@@ -15,10 +15,10 @@ PED_COLOR = {
 CAR_HEADWAY = 2
 
 SIDES = {
-    ("pedestrian", "up"): ((315, 125), "Pešaci ↑"),
-    ("pedestrian", "down"): ((277, 455), "Pešaci ↓"),
-    ("vehicle", "right"): ((470, 200), "Vozila →"),
-    ("vehicle", "left"): ((170, 340), "Vozila ←"),
+    ("pedestrian", "up"): ((315, 125), "Pešaci"),
+    ("pedestrian", "down"): ((277, 455), "Pešaci"),
+    ("vehicle", "right"): ((470, 200), "Vozila"),
+    ("vehicle", "left"): ((170, 340), "Vozila"),
 }
 KIND_NAME = {"pedestrian": "Pešaci", "vehicle": "Vozila"}
 
@@ -59,7 +59,7 @@ class Intersection:
         self.counter_labels = {}
         for key, ((x, y), name) in SIDES.items():
             lbl = tk.Label(self.canvas, text=f"{name}: 0", bg="white", relief="solid", bd=1,
-                           font=("Arial", 11, "bold"))
+                           font=("Arial", 13, "bold"),padx=4,pady=2,)
             self.canvas.create_window(x, y, window=lbl)
             self.counter_labels[key] = lbl
 

@@ -1,12 +1,17 @@
 import threading
+from typing import Any, Callable, Dict, List, Optional, Set
+
 import cv2
 import numpy as np
-import time
-from typing import Callable, Optional, List, Dict, Any
-from ultralytics import YOLO
+
+from video_detection.base_detector import BaseDetector, Detection
 
 
-class VehicleDetector:
+class VehicleDetector(BaseDetector):
+    tracker = "botsort.yaml"
+    overlay_color = (0, 255, 255)
+    marker_radius = 4
+
     def __init__(
             self,
             model_path="yolov8s.pt",
@@ -20,34 +25,17 @@ class VehicleDetector:
             color_inside=(0, 0, 255),
             color_zone=(255, 255, 0)
     ):
-        self.conf_thresh = conf_thresh
+        # COCO classes: 1 - bikes, 2 - cars, 3 - motorbikes, 5 - buses, 7 - trucks
+        # 0 - people, because yolo has problems with motorbikes
+        super().__init__(model_path, conf_thresh, frame_skip,
+                         target_classes=target_classes or [0, 1, 2, 3, 5, 7],
+                         color_zone=color_zone)
         self.miss_limit = miss_limit
-        self.frame_skip = frame_skip
         self.relink_window = relink_window
         self.relink_max_dist = relink_max_dist
 
-        # COCO Vehicle Classes
-        # 1 - bikes, 2 - cars, 3 - buses, 5 - trucks
-        # 0 - people because yolo has problem with motorbikes
-        self.target_classes = target_classes or [0, 1, 2, 3, 5, 7]
-
         self.color_outside = color_outside
         self.color_inside = color_inside
-        self.color_zone = color_zone
-
-        self.model = YOLO(model_path)
-
-    # remove "false" new IDs
-    @staticmethod
-    def _find_relink(departures, cx, cy, timestamp, relink_window, relink_max_dist):
-        best_tid, best_dist = None, None
-        for d_tid, dep in departures.items():
-            if timestamp - dep["last_ts"] > relink_window:
-                continue
-            dist = ((cx - dep["last_cx"]) ** 2 + (cy - dep["last_cy"]) ** 2) ** 0.5
-            if dist <= relink_max_dist and (best_dist is None or dist < best_dist):
-                best_tid, best_dist = d_tid, dist
-        return best_tid
 
     def process_video(
             self,
@@ -59,165 +47,107 @@ class VehicleDetector:
             show_window: bool = True,
             on_frame: Optional[Callable[[np.ndarray], None]] = None,
     ) -> List[Dict[str, Any]]:
+        return self.run(video_source, zone_pts, window_name,
+                        on_arrival, stop_event, show_window, on_frame)
 
-        cap = cv2.VideoCapture(video_source)
-        if not cap.isOpened():
-            print(f"Error: Could not open video source '{video_source}'.")
-            return []
+    def _reset_state(self) -> None:
+        self.track_state: Dict[int, Dict[str, Any]] = {}
+        self.departures: Dict[int, Dict[str, Any]] = {}
+        self.notified_ids = set()
+        self.arrivals_log: List[Dict[str, Any]] = []
 
-        zone_polygon = np.array(zone_pts, dtype=np.int32)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        frame_duration = 1.0 / fps
+    def _on_new_frame(self, timestamp: float) -> None:
+        """Forget departures that are too old to be relinked."""
+        expired = [tid for tid, dep in self.departures.items()
+                   if timestamp - dep["last_ts"] > self.relink_window]
+        for tid in expired:
+            del self.departures[tid]
 
-        track_state: Dict[int, Dict[str, Any]] = {}
-        notified_ids = set()
-        departures: Dict[int, Dict[str, Any]] = {}
-        last_results = []
+    def _update_track(self, det: Detection, timestamp: float):
+        v_type = self._vehicle_type(det)
+        if self._is_inside(det):
+            self._on_inside(det, v_type, timestamp)
+            return self.color_inside
+        self._on_outside(det.tid, timestamp)
+        return self.color_outside
 
-        arrivals_log: List[Dict[str, Any]] = []
+    def _vehicle_type(self, det: Detection) -> str:
+        return self.model.names.get(det.cls_id, "vehicle")
 
-        if show_window:
-            print(f"Press 'q' or 'ESC' to stop.")
+    def _is_inside(self, det: Detection) -> bool:
+        cx, cy = det.center
+        return cv2.pointPolygonTest(self.zone.polygon, (float(cx), float(cy)), False) >= 0
 
-        while cap.isOpened():
-            if stop_event is not None and stop_event.is_set():
-                break
+    def _on_inside(self, det: Detection, v_type: str, timestamp: float) -> None:
+        if det.tid not in self.track_state:
+            self._start_track(det, v_type, timestamp)
+        else:
+            self._refresh_track(det, timestamp)
+        self._log_arrival_once(det.tid, v_type, timestamp)
 
-            frame_start = time.time()
+    def _start_track(self, det: Detection, v_type: str, timestamp: float) -> None:
+        cx, cy = det.center
+        match_tid = self._find_relink(self.departures, cx, cy, timestamp,
+                                      self.relink_window, self.relink_max_dist)
+        if match_tid is not None:
+            # same vehicle continuing under a new tracker ID: not a new arrival
+            del self.departures[match_tid]
+            self.notified_ids.add(det.tid)
+        self.track_state[det.tid] = {
+            "type": v_type, "missed": 0,
+            "last_cx": cx, "last_cy": cy, "last_ts": timestamp,
+        }
 
-            ret, frame = cap.read()
-            if not ret:
-                break
+    def _refresh_track(self, det: Detection, timestamp: float) -> None:
+        cx, cy = det.center
+        self.track_state[det.tid].update(
+            missed=0, last_cx=cx, last_cy=cy, last_ts=timestamp)
 
-            frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-            timestamp = frame_idx / fps
+    def _log_arrival_once(self, tid: int, v_type: str, timestamp: float) -> None:
+        if tid in self.notified_ids:
+            return
+        self.notified_ids.add(tid)
+        entry_time = round(timestamp, 2)
+        self.arrivals_log.append({"type": v_type, "arrival": entry_time})
+        self._notify(tid, v_type, entry_time)
 
-            # remove departures older than the relink
-            for d_tid in [d for d, dep in departures.items()
-                          if timestamp - dep["last_ts"] > self.relink_window]:
-                del departures[d_tid]
+    def _on_outside(self, tid: int, timestamp: float) -> None:
+        """Remember where the vehicle left the ROI so an ID switch can be relinked."""
+        state = self.track_state.pop(tid, None)
+        if state is not None:
+            self.departures[tid] = {
+                "last_cx": state["last_cx"], "last_cy": state["last_cy"],
+                "last_ts": timestamp,
+            }
 
-            # Detection: uses BotSort
-            if frame_idx % self.frame_skip == 0 or not last_results:
-                last_results = self.model.track(
-                    frame,
-                    persist=True,
-                    classes=self.target_classes,
-                    conf=self.conf_thresh,
-                    verbose=False,
-                    tracker="botsort.yaml"
-                )
-            results = last_results
+    @staticmethod
+    def _find_relink(departures, cx, cy, timestamp, relink_window, relink_max_dist):
+        best_tid, best_dist = None, None
+        for d_tid, dep in departures.items():
+            if timestamp - dep["last_ts"] > relink_window:
+                continue
+            dist = ((cx - dep["last_cx"]) ** 2 + (cy - dep["last_cy"]) ** 2) ** 0.5
+            if dist <= relink_max_dist and (best_dist is None or dist < best_dist):
+                best_tid, best_dist = d_tid, dist
+        return best_tid
 
-            active_ids = set()
+    def _handle_lost(self, active_ids: Set[int], timestamp: float) -> None:
+        for tid in list(self.track_state):
+            if tid in active_ids:
+                continue
+            self.track_state[tid]["missed"] += 1
+            if self.track_state[tid]["missed"] > self.miss_limit:
+                self._move_to_departures(tid)
 
-            for result in results:
-                if result.boxes is None or result.boxes.id is None:
-                    continue
+    def _move_to_departures(self, tid: int) -> None:
+        state = self.track_state.pop(tid)
+        self.departures[tid] = {
+            "last_cx": state["last_cx"], "last_cy": state["last_cy"],
+            "last_ts": state["last_ts"],
+        }
 
-                boxes = result.boxes.xyxy.cpu().numpy().astype(int)
-                ids = result.boxes.id.cpu().numpy().astype(int)
-                clss = result.boxes.cls.cpu().numpy().astype(int)
+    def _collect_results(self) -> List[Dict[str, Any]]:
+        return self.arrivals_log
 
-                for (x1, y1, x2, y2), tid, cls_id in zip(boxes, ids, clss):
-                    tid = int(tid)
-                    active_ids.add(tid)
-
-                    # Taking the center of vehicle
-                    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                    v_type = self.model.names.get(cls_id, "vehicle")
-
-                    # Is center of box inside of ROI
-                    is_inside = cv2.pointPolygonTest(zone_polygon, (float(cx), float(cy)), False) >= 0
-
-                    if is_inside:
-                        if tid not in track_state:
-                            match_tid = self._find_relink(
-                                departures, cx, cy, timestamp,
-                                self.relink_window, self.relink_max_dist
-                            )
-                            if match_tid is not None:
-                                # same vehicle continuing under a new tracker ID
-                                # remove it
-                                del departures[match_tid]
-                                notified_ids.add(tid)
-
-                            track_state[tid] = {
-                                "type": v_type, "missed": 0,
-                                "last_cx": cx, "last_cy": cy, "last_ts": timestamp,
-                            }
-                        else:
-                            track_state[tid]["missed"] = 0
-                            track_state[tid]["last_cx"] = cx
-                            track_state[tid]["last_cy"] = cy
-                            track_state[tid]["last_ts"] = timestamp
-
-                        if tid not in notified_ids:
-                            notified_ids.add(tid)
-                            entry_time = round(timestamp, 2)
-                            arrivals_log.append({"type": v_type, "arrival": entry_time})
-                            if on_arrival is not None:
-                                on_arrival(tid, v_type, entry_time)
-
-                        color = self.color_inside
-                    else:
-                        # remember where car left ROI, so a
-                        # tracker ID switch after can be relinked
-                        if tid in track_state:
-                            state = track_state[tid]
-                            departures[tid] = {
-                                "last_cx": state["last_cx"],
-                                "last_cy": state["last_cy"],
-                                "last_ts": timestamp,
-                            }
-                            del track_state[tid]
-
-                        color = self.color_outside
-
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    cv2.circle(frame, (cx, cy), 4, color, -1)
-                    cv2.putText(frame, f"{v_type.upper()} {tid}", (x1, y1 - 8),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-
-            # Lost objects
-            for tid in list(track_state.keys()):
-                if tid not in active_ids:
-                    track_state[tid]["missed"] += 1
-                    if track_state[tid]["missed"] > self.miss_limit:
-                        state = track_state[tid]
-                        departures[tid] = {
-                            "last_cx": state["last_cx"],
-                            "last_cy": state["last_cy"],
-                            "last_ts": state["last_ts"],
-                        }
-                        del track_state[tid]
-
-            if show_window or on_frame is not None:
-                # Drawing the ROI
-                overlay = frame.copy()
-                cv2.fillPoly(overlay, [zone_polygon], (0, 255, 255))
-                cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
-                cv2.polylines(frame, [zone_polygon], isClosed=True, color=self.color_zone, thickness=2)
-
-            if on_frame is not None:
-                on_frame(frame)
-
-            if show_window:
-                cv2.imshow(window_name, frame)
-                key = cv2.waitKey(1) & 0xFF
-                if key in (ord('q'), 27):
-                    break
-
-            elapsed = time.time() - frame_start
-            remaining = frame_duration - elapsed
-            if remaining > 0:
-                time.sleep(remaining)
-
-        cap.release()
-        if show_window:
-            try:
-                cv2.destroyWindow(window_name)
-            except cv2.error:
-                pass
-
-        return arrivals_log
+    def _label(self, det: Detection) -> str:
+        return f"{self._vehicle_type(det).upper()} {det.tid}"

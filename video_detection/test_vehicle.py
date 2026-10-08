@@ -34,7 +34,7 @@ def main():
         frame_skip=2
     )
 
-    camera = cameras[1]
+    camera = cameras[0]
 
     records = detector.process_video(
         video_source=camera.source,

@@ -1,14 +1,18 @@
 import threading
-import cv2
+from typing import Callable, List, Optional, Set
+
 import numpy as np
-import time
-from typing import Callable, List, Optional
-from ultralytics import YOLO
+
 from datatypes import PedestrianRecord
+from video_detection.base_detector import BaseDetector, Detection
 from video_detection.utils import rect_in_zone
 
 
-class PedestrianDetector:
+class PedestrianDetector(BaseDetector):
+    tracker = "bytetrack.yaml"
+    overlay_color = (255, 50, 50)
+    marker_radius = 5
+
     def __init__(
             self,
             model_path="yolov8n.pt",
@@ -27,11 +31,11 @@ class PedestrianDetector:
             color_excluded=(128, 128, 128),
             color_zone=(255, 0, 0)
     ):
+        super().__init__(model_path, conf_thresh, frame_skip,
+                         target_classes=[0], color_zone=color_zone)
         self.alert_time = alert_time
         self.overlap_thresh = overlap_thresh
-        self.conf_thresh = conf_thresh
         self.leave_grace = leave_grace
-        self.frame_skip = frame_skip
         self.filter_zone_origin = filter_zone_origin
         self.origin_bottom_frac = origin_bottom_frac
         self.filter_moving_up = filter_moving_up
@@ -41,20 +45,6 @@ class PedestrianDetector:
         self.color_entered = color_entered
         self.color_alert = color_alert
         self.color_excluded = color_excluded
-        self.color_zone = color_zone
-
-        self.model = YOLO(model_path)
-
-    # Create proper type from available data
-    @staticmethod
-    def _make_record(tid, state) -> PedestrianRecord:
-        return PedestrianRecord(
-            id=int(tid),
-            type="person",
-            appeared_at=round(state["entry_ts"], 2),
-            left=round(state["last_in_zone"], 2),
-            waiting_time=round(state["last_in_zone"] - state["entry_ts"], 2)
-        )
 
     def process_video(
             self,
@@ -66,175 +56,105 @@ class PedestrianDetector:
             show_window: bool = True,
             on_frame: Optional[Callable[[np.ndarray], None]] = None,
     ) -> List[PedestrianRecord]:
+        return self.run(video_source, polygon_pts, window_name,
+                        on_qualified, stop_event, show_window, on_frame)
 
-        cap = cv2.VideoCapture(video_source)
-        if not cap.isOpened():
-            print(f"Error: Could not open video source '{video_source}'.")
-            return []
+    def _reset_state(self) -> None:
+        self.track_state = {}
+        self.notified_ids = set()
+        self.seen_ids = set()
+        self.excluded_ids = set()
+        self.first_cy = {}
+        self.completed_records: List[PedestrianRecord] = []
 
-        polygon_pts = np.array(polygon_pts, dtype=np.int32)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        frame_duration = 1.0 / fps
+        zone = self.zone
+        self.origin_min_cy = zone.max_y - (zone.max_y - zone.min_y) * self.origin_bottom_frac
 
-        zone_mask = np.zeros((height, width), dtype=np.uint8)
-        cv2.fillPoly(zone_mask, [polygon_pts], 255)
+    def _update_track(self, det: Detection, timestamp: float):
+        in_zone = self._in_zone(det)
+        self._register_first_sight(det, in_zone)
+        self._exclude_if_moving_up(det)
 
-        # in order to filter out people who come from above, find y coordinates
-        zone_min_y = int(polygon_pts[:, 1].min())
-        zone_max_y = int(polygon_pts[:, 1].max())
-        origin_min_cy = zone_max_y - (zone_max_y - zone_min_y) * self.origin_bottom_frac
+        if det.tid in self.excluded_ids:
+            return self.color_excluded
+        if in_zone:
+            return self._track_in_zone(det.tid, timestamp)
+        return self._track_outside(det.tid, timestamp)
 
-        track_state = {}
-        # remove duplicates
-        notified_ids = set()
-        seen_ids = set()
-        excluded_ids = set()
-        first_cy = {}
-        last_results = []
+    def _in_zone(self, det: Detection) -> bool:
+        return rect_in_zone(*det.box, self.zone.mask) >= self.overlap_thresh
 
-        completed_records: List[PedestrianRecord] = []
-        timestamp = 0.0
+    def _register_first_sight(self, det: Detection, in_zone: bool) -> None:
+        if det.tid in self.seen_ids:
+            return
+        cy = det.center[1]
+        self.seen_ids.add(det.tid)
+        self.first_cy[det.tid] = cy
+        if self.filter_zone_origin and in_zone and cy >= self.origin_min_cy:
+            self.excluded_ids.add(det.tid)
 
-        if show_window:
-            print(f"Press 'q' or 'ESC' to stop.")
+    def _exclude_if_moving_up(self, det: Detection) -> None:
+        if det.tid in self.excluded_ids or not self.filter_moving_up:
+            return
+        if self.first_cy[det.tid] - det.center[1] > self.move_up_thresh:
+            self.excluded_ids.add(det.tid)
+            self.track_state.pop(det.tid, None)
 
-        while cap.isOpened():
-            # threading support
-            if stop_event is not None and stop_event.is_set():
-                break
+    def _track_in_zone(self, tid: int, timestamp: float):
+        state = self.track_state.setdefault(
+            tid, {"entry_ts": timestamp, "last_in_zone": timestamp, "qualified": False})
+        state["last_in_zone"] = timestamp
+        self._qualify_if_waited(tid, state, timestamp)
+        return self._state_color(state)
 
-            frame_start = time.time()
+    def _qualify_if_waited(self, tid: int, state: dict, timestamp: float) -> None:
+        dwell = timestamp - state["entry_ts"]
+        if dwell < self.alert_time or state["qualified"]:
+            return
+        state["qualified"] = True
+        if tid not in self.notified_ids:
+            self.notified_ids.add(tid)
+            self._notify(tid, timestamp, dwell)
 
-            ret, frame = cap.read()
-            if not ret:
-                break
+    def _track_outside(self, tid: int, timestamp: float):
+        state = self.track_state.get(tid)
+        if state is None:
+            return self.color_outside
+        if self._left_zone(state, timestamp):
+            self._close_track(tid)
+            return self.color_outside
+        return self._state_color(state)
 
-            # detection and tracking
-            frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-            timestamp = frame_idx / fps
+    def _state_color(self, state: dict):
+        return self.color_alert if state["qualified"] else self.color_entered
 
-            if frame_idx % self.frame_skip == 0 or not last_results:
-                last_results = self.model.track(
-                    frame,
-                    persist=True,
-                    classes=[0],
-                    conf=self.conf_thresh,
-                    verbose=False,
-                    tracker="bytetrack.yaml"
-                )
-            results = last_results
+    def _left_zone(self, state: dict, timestamp: float) -> bool:
+        return timestamp - state["last_in_zone"] > self.leave_grace
 
-            active_ids = set()
+    def _close_track(self, tid: int) -> None:
+        state = self.track_state.pop(tid)
+        if state["qualified"]:
+            self.completed_records.append(self._make_record(tid, state))
 
-            for result in results:
-                if result.boxes is None or result.boxes.id is None:
-                    continue
+    def _handle_lost(self, active_ids: Set[int], timestamp: float) -> None:
+        for tid in list(self.track_state):
+            if tid not in active_ids and self._left_zone(self.track_state[tid], timestamp):
+                self._close_track(tid)
 
-                boxes = result.boxes.xyxy.cpu().numpy().astype(int)
-                ids = result.boxes.id.cpu().numpy().astype(int)
+    def _collect_results(self) -> List[PedestrianRecord]:
+        for tid in list(self.track_state):
+            self._close_track(tid)
+        return self.completed_records
 
-                for (x1, y1, x2, y2), tid in zip(boxes, ids):
-                    tid = int(tid)
-                    active_ids.add(tid)
-                    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                    in_zone = rect_in_zone(x1, y1, x2, y2, zone_mask) >= self.overlap_thresh
+    @staticmethod
+    def _make_record(tid, state) -> PedestrianRecord:
+        return PedestrianRecord(
+            id=int(tid),
+            type="person",
+            appeared_at=round(state["entry_ts"], 2),
+            left=round(state["last_in_zone"], 2),
+            waiting_time=round(state["last_in_zone"] - state["entry_ts"], 2)
+        )
 
-                    if tid not in seen_ids:
-                        seen_ids.add(tid)
-                        first_cy[tid] = cy
-                        if self.filter_zone_origin and in_zone and cy >= origin_min_cy:
-                            excluded_ids.add(tid)
-
-                    if tid not in excluded_ids and self.filter_moving_up:
-                        drifted_up = first_cy[tid] - cy
-                        if drifted_up > self.move_up_thresh:
-                            excluded_ids.add(tid)
-                            track_state.pop(tid, None)
-
-                    if tid in excluded_ids:
-
-                        color = self.color_excluded
-
-                    elif in_zone:
-                        if tid not in track_state:
-                            track_state[tid] = {
-                                "entry_ts": timestamp,
-                                "last_in_zone": timestamp,
-                                "qualified": False
-                            }
-
-                        state = track_state[tid]
-                        state["last_in_zone"] = timestamp
-                        dwell = timestamp - state["entry_ts"]
-
-                        # Pedestrian is qualified if he waits 3 seconds
-                        if dwell >= self.alert_time and not state["qualified"]:
-                            state["qualified"] = True
-                            if tid not in notified_ids:
-                                notified_ids.add(tid)
-                                if on_qualified is not None:
-                                    on_qualified(tid, timestamp, dwell)
-
-                        color = self.color_alert if state["qualified"] else self.color_entered
-                    else:
-                        state = track_state.get(tid)
-                        if state is None:
-                            color = self.color_outside
-                        elif timestamp - state["last_in_zone"] > self.leave_grace:
-                            if state["qualified"]:
-                                completed_records.append(self._make_record(tid, state))
-                            del track_state[tid]
-                            color = self.color_outside
-                        else:
-                            color = self.color_alert if state["qualified"] else self.color_entered
-
-                    # draw the bounding box
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    cv2.circle(frame, (cx, cy), 5, color, -1)
-                    cv2.putText(frame, f"ID {tid}", (x1, y1 - 8),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-
-            # cleanup of disappearing pedestrians
-            for tid in list(track_state.keys()):
-                if tid not in active_ids:
-                    state = track_state[tid]
-                    if timestamp - state["last_in_zone"] > self.leave_grace:
-                        if state["qualified"]:
-                            completed_records.append(self._make_record(tid, state))
-                        del track_state[tid]
-
-            if show_window or on_frame is not None:
-                # Drawing ROI overlay
-                overlay = frame.copy()
-                cv2.fillPoly(overlay, [polygon_pts], (255, 50, 50))
-                cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
-                cv2.polylines(frame, [polygon_pts], isClosed=True, color=self.color_zone, thickness=2)
-
-            if on_frame is not None:
-                on_frame(frame)
-
-            if show_window:
-                cv2.imshow(window_name, frame)
-                key = cv2.waitKey(1) & 0xFF
-                if key in (ord('q'), 27):
-                    break
-
-            elapsed = time.time() - frame_start
-            remaining = frame_duration - elapsed
-            if remaining > 0:
-                time.sleep(remaining)
-
-        for tid, state in track_state.items():
-            if state["qualified"]:
-                completed_records.append(self._make_record(tid, state))
-
-        cap.release()
-        if show_window:
-            try:
-                cv2.destroyWindow(window_name)
-            except cv2.error:
-                pass
-
-        return completed_records
+    def _label(self, det: Detection) -> str:
+        return f"ID {det.tid}"
